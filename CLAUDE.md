@@ -75,32 +75,38 @@ sudo docker network ls | grep kisaes-net
 
 ---
 
-## PHASE 4: Deploy Ollama + GLM-OCR
+## PHASE 4: Deploy GLM-OCR
 
-Run Ollama as a Docker container on the shared network:
+Run the self-contained GLM-OCR appliance on the shared network. The GGUF model is baked into the image — no separate model pull needed.
 
 ```bash
 sudo docker run -d \
-  --name ollama \
+  --name vibe-glm-ocr \
   --restart=always \
   --network kisaes-net \
-  -p 11434:11434 \
-  -v ollama_data:/root/.ollama \
-  ollama/ollama:latest
+  -p 8090:8090 \
+  --log-driver json-file \
+  --log-opt max-size=50m \
+  --log-opt max-file=5 \
+  ghcr.io/kisaesdevlab/vibe-glm-ocr:latest
 ```
 
-Wait for the container to be healthy, then pull GLM-OCR:
+Wait for the model to load (~10s first boot), then check health:
 
 ```bash
-sleep 5
-sudo docker exec ollama ollama pull glm-ocr
+sleep 15
+curl -fsS http://localhost:8090/health
 ```
 
 **Verify:**
 ```bash
-sudo docker ps --filter name=ollama --format "{{.Names}} {{.Status}}"
-sudo docker exec ollama ollama list | grep glm-ocr
+sudo docker ps --filter name=vibe-glm-ocr --format "{{.Names}} {{.Status}}"
+curl -fsS http://localhost:8090/health
 ```
+
+The container should be `Up` and `/health` should return `{"status":"ok"}`.
+
+> Note: GLM-OCR serves an OpenAI-compatible API at `/v1/chat/completions`. The Vibe TB and Vibe MB apps currently expect an Ollama-style endpoint for local OCR, so wiring them to this service requires an app-side change that is **out of scope for this provisioning guide**. Configure the OCR endpoint via each app's Admin UI once the apps are updated.
 
 ---
 
@@ -137,7 +143,6 @@ services:
       - vibe-tb-db
     environment:
       DATABASE_URL: postgres://vibedb:CHANGE_ME_TB@vibe-tb-db:5432/vibe_tb
-      OLLAMA_BASE_URL: http://ollama:11434
       NODE_ENV: production
     ports:
       - "3000:3000"
@@ -209,7 +214,6 @@ services:
     environment:
       DATABASE_URL: postgres://vibedb:CHANGE_ME_MB@vibe-mb-db:5432/vibe_mb
       REDIS_URL: redis://vibe-mb-redis:6379
-      OLLAMA_BASE_URL: http://ollama:11434
       NODE_ENV: production
     ports:
       - "3001:3000"
@@ -457,8 +461,8 @@ sudo docker network ls | grep kisaes-net
 echo "=== Containers ==="
 sudo docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" | sort
 
-echo "=== Ollama + GLM-OCR ==="
-sudo docker exec ollama ollama list | grep glm-ocr
+echo "=== GLM-OCR ==="
+curl -fsS http://localhost:8090/health
 
 echo "=== Tailscale ==="
 tailscale ip -4
@@ -484,7 +488,7 @@ done
 
 | Container        | Port(s)        |
 |------------------|----------------|
-| ollama           | 11434          |
+| vibe-glm-ocr     | 8090           |
 | vibe-tb-app      | 3000           |
 | vibe-tb-db       | 5432 (internal)|
 | vibe-mb-app      | 3001→3000      |

@@ -8,7 +8,7 @@ Automated provisioning for Ubuntu Server 24.04 LTS machines running the Kisaes a
 |---|---|---|
 | **Vibe Trial Balance** | Trial balance, tax workpapers, AI classification | `http://<ip>/tb/` |
 | **Vibe MyBooks** | Bookkeeping, transaction coding, client portal | `http://<ip>/mb/` |
-| **GLM-OCR (Ollama)** | Document OCR for scanned financials | Internal API `:11434` |
+| **GLM-OCR** | Document OCR appliance (self-contained llama.cpp + GLM-OCR GGUF) | Internal API `:8090` |
 | **Landing Page** | App selector served on port 80 | `http://<ip>` |
 | **Cockpit** | Web-based server & network management | `https://<ip>:9090` |
 | **Portainer CE** | Docker container management UI | `https://<ip>:9443` |
@@ -57,7 +57,7 @@ Port 80 (Nginx)
 
 Port 9090         → Cockpit (server management)
 Port 9443         → Portainer (Docker management)
-Port 11434        → Ollama / GLM-OCR API (internal)
+Port 8090         → GLM-OCR API (internal, OpenAI-compatible)
 Port 8200         → Duplicati (backups)
 
 Tailscale         → Mesh VPN overlay (all ports reachable remotely)
@@ -67,7 +67,7 @@ Tailscale         → Mesh VPN overlay (all ports reachable remotely)
 
 | Container | Image | Network | Restart |
 |---|---|---|---|
-| `ollama` | `ollama/ollama:latest` | kisaes-net | always |
+| `vibe-glm-ocr` | `ghcr.io/kisaesdevlab/vibe-glm-ocr:latest` | kisaes-net | always |
 | `vibe-tb-app` | `ghcr.io/kisaesdevlab/vibe-trial-balance:latest` | kisaes-net | always |
 | `vibe-tb-db` | `postgres:16-alpine` | kisaes-net | always |
 | `vibe-mb-app` | `ghcr.io/kisaesdevlab/vibe-mybooks:latest` | kisaes-net | always |
