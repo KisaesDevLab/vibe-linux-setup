@@ -27,16 +27,27 @@ On a fresh Ubuntu Server 24.04 LTS mini PC, run:
 curl -fsSL https://raw.githubusercontent.com/KisaesDevLab/vibe-Linux-Setup/main/bootstrap.sh | bash
 ```
 
-This installs git, Claude Code, and clones this repo. Then:
+That's it. `bootstrap.sh` installs git, clones this repo, and runs `provision.sh`, which executes all 14 phases end-to-end (Docker, GLM-OCR, Vibe TB, Vibe MB, Portainer, Duplicati, Tailscale, Cockpit, Nginx, UFW) and also installs Claude Code for ongoing maintenance.
+
+The script is **idempotent** — safe to re-run if anything fails mid-way.
+
+### Unattended mode
+
+Pre-provide the Tailscale auth key to run with zero prompts:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/KisaesDevLab/vibe-Linux-Setup/main/bootstrap.sh \
+  | TAILSCALE_AUTHKEY=tskey-auth-xxxxx bash
+```
+
+Other env vars: `TB_DB_PASSWORD`, `MB_DB_PASSWORD`. Flags passed to bootstrap are forwarded to `provision.sh` (e.g. `--skip-tailscale`, `--skip-claude`).
+
+### Running locally after clone
 
 ```bash
 cd ~/vibe-Linux-Setup
-claude
+./provision.sh
 ```
-
-Tell Claude Code: **"Run the provisioning guide"**
-
-Claude Code reads `CLAUDE.md` and executes all 14 phases automatically, verifying each step before moving on.
 
 ## Requirements
 
@@ -45,7 +56,7 @@ Claude Code reads `CLAUDE.md` and executes all 14 phases automatically, verifyin
 - **RAM:** 8 GB minimum, 16 GB recommended
 - **Storage:** 40 GB+ available
 - **Network:** Internet connection (required during provisioning)
-- **Claude Code:** Requires a Claude Pro ($20/mo), Max, or Console account
+- **Claude Code (optional):** Installed by the provisioner for ongoing maintenance. Requires a Claude Pro, Max, or Console account to authenticate — the provisioner itself does not depend on it.
 
 ## Architecture
 
@@ -89,9 +100,10 @@ After Claude Code completes all 14 phases:
 
 ```
 vibe-Linux-Setup/
-├── CLAUDE.md         # Phase-by-phase provisioning instructions (read by Claude Code)
+├── CLAUDE.md         # Phase-by-phase reference (also usable by Claude Code for debugging)
 ├── README.md         # This file
-├── bootstrap.sh      # One-line entry point for fresh boxes
+├── bootstrap.sh      # One-line entry point: installs git, clones repo, runs provision.sh
+├── provision.sh      # Idempotent 14-phase provisioner (does the actual work)
 └── assets/
     └── landing.html  # Landing page source (deployed to /var/www/kisaes/)
 ```

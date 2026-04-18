@@ -1,5 +1,7 @@
 # CLAUDE.md — Vibe Linux Setup
 
+> **Primary install path is now `./provision.sh`** — an idempotent bash script that executes every phase below end-to-end with no LLM in the loop. This document remains the authoritative reference for what each phase does and is useful when debugging a failed provision or performing manual maintenance. If a user asks you to "run the provisioning guide," prefer executing `provision.sh` over walking through these phases by hand.
+
 You are provisioning a fresh Ubuntu Server 24.04 LTS mini PC. Execute each phase in order. After each phase, run the verification command(s) and confirm they pass before moving on. If a verification fails, diagnose and fix before continuing.
 
 Do NOT skip phases. Do NOT combine phases. Execute one phase at a time and verify.
