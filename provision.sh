@@ -12,10 +12,12 @@
 #   ./provision.sh --skip-tailscale   # skip Tailscale phase
 #
 # Environment overrides:
-#   VIBE_DOMAIN         base hostname for the three apps   (default: kisaes.lan)
+#   VIBE_DOMAIN         base hostname for the three apps   (default: kisaes.local)
 #                         landing → http://<VIBE_DOMAIN>/
 #                         TB      → http://tb.<VIBE_DOMAIN>/
 #                         MB      → http://mb.<VIBE_DOMAIN>/
+#                         Default is a .local (mDNS) domain — zero client-side
+#                         DNS config required on modern macOS / Linux / Win10+.
 #   TAILSCALE_AUTHKEY   pre-auth key for unattended Tailscale registration
 #   LOG_FILE            provisioning log path              (default: ~/vibe-provision.log)
 #
@@ -29,7 +31,7 @@ set -euo pipefail
 # ---- Config --------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_FILE="${LOG_FILE:-$HOME/vibe-provision.log}"
-VIBE_DOMAIN="${VIBE_DOMAIN:-kisaes.lan}"
+VIBE_DOMAIN="${VIBE_DOMAIN:-kisaes.local}"
 TB_URL="http://tb.${VIBE_DOMAIN}"
 MB_URL="http://mb.${VIBE_DOMAIN}"
 LANDING_URL="http://${VIBE_DOMAIN}"
@@ -110,7 +112,9 @@ phase_1_base() {
     sudo apt-get update -qq
     sudo DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -qq
     sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-        curl wget gnupg ca-certificates lsb-release software-properties-common nginx
+        curl wget gnupg ca-certificates lsb-release software-properties-common nginx \
+        avahi-daemon avahi-utils apache2-utils
+    sudo systemctl enable --now avahi-daemon >/dev/null 2>&1 || true
     ok "Base packages installed ($(nginx -v 2>&1))"
 }
 
@@ -188,11 +192,14 @@ phase_4_glm_ocr() {
         ok "vibe-glm-ocr already running"
     else
         container_exists vibe-glm-ocr && sudo docker rm -f vibe-glm-ocr >/dev/null
+        # Bound to 127.0.0.1 — only the host (curl / nginx) and other containers
+        # on kisaes-net (via container name `vibe-glm-ocr:8090`) reach it. Not
+        # exposed to the LAN because no browser-facing consumer needs it.
         sudo docker run -d \
             --name vibe-glm-ocr \
             --restart=always \
             --network kisaes-net \
-            -p 8090:8090 \
+            -p 127.0.0.1:8090:8090 \
             --log-driver json-file \
             --log-opt max-size=50m \
             --log-opt max-file=5 \
@@ -288,11 +295,13 @@ services:
     depends_on:
       server:
         condition: service_healthy
-    # Host port 3000 → client's internal nginx on 80. Host nginx then proxies
-    # tb.<VIBE_DOMAIN> here. Not published on 80 directly so host nginx owns
-    # that port for hostname-based routing across all three apps.
+    # Bound to 127.0.0.1 — the only consumer is host nginx (proxying
+    # tb.<VIBE_DOMAIN> → 127.0.0.1:3000). Binding to all interfaces would
+    # let a LAN client hit http://<host>:3000 directly, bypassing nginx
+    # and confusing the app's CORS check (Origin=http://<ip>:3000 vs the
+    # configured ALLOWED_ORIGIN=http://tb.<VIBE_DOMAIN>).
     ports:
-      - "3000:80"
+      - "127.0.0.1:3000:80"
     networks: [kisaes-net]
 
 volumes:
@@ -376,8 +385,10 @@ services:
       BACKUP_DIR: /data/backups
     volumes:
       - ./data:/data
+    # Bound to 127.0.0.1 — host nginx proxies mb.<VIBE_DOMAIN> →
+    # 127.0.0.1:3001. LAN clients must go through nginx so CORS lines up.
     ports:
-      - "3001:3001"
+      - "127.0.0.1:3001:3001"
     networks: [kisaes-net]
 
 volumes:
@@ -394,11 +405,34 @@ EOF
 }
 
 # ---- Phase 7: Portainer --------------------------------------------------
+# Pre-seeds the admin account so the 5-minute signup lockout never fires.
+# Plaintext is persisted to ~/vibe-portainer/admin-password (chmod 600) so
+# re-runs reuse the same credential instead of generating a new one each time.
 phase_7_portainer() {
     phase "PHASE 7 — Deploy Portainer CE"
     volume_exists portainer_data || sudo docker volume create portainer_data >/dev/null
+
+    mkdir -p "$HOME/vibe-portainer"
+    local pw_file="$HOME/vibe-portainer/admin-password"
+    touch "$pw_file"
+    chmod 600 "$pw_file"
+
+    local admin_pw admin_hash
+    if [ -s "$pw_file" ]; then
+        admin_pw="$(cat "$pw_file")"
+    else
+        admin_pw="$(openssl rand -base64 32 | tr -d '=+/' | head -c 24)"
+        printf '%s\n' "$admin_pw" > "$pw_file"
+        chmod 600 "$pw_file"
+    fi
+
+    # htpasswd ships with apache2-utils (installed in phase 1). -B = bcrypt.
+    # The hash contains `$` signs — `--admin-password` takes the hash directly;
+    # double-quoting expands the shell var but leaves the hash intact.
+    admin_hash="$(htpasswd -nbB admin "$admin_pw" | cut -d: -f2)"
+
     if container_running portainer; then
-        ok "Portainer already running"
+        ok "Portainer already running (credentials in $pw_file)"
         return
     fi
     container_exists portainer && sudo docker rm -f portainer >/dev/null
@@ -410,27 +444,85 @@ phase_7_portainer() {
         -p 9443:9443 \
         -v /var/run/docker.sock:/var/run/docker.sock \
         -v portainer_data:/data \
-        portainer/portainer-ce:lts >/dev/null
-    ok "Portainer started — finish setup at https://<host>:9443 within 5 minutes"
+        portainer/portainer-ce:lts \
+        --admin-password="${admin_hash}" >/dev/null
+    ok "Portainer started with pre-seeded admin (user: admin, password: $pw_file)"
 }
 
 # ---- Phase 8: Duplicati --------------------------------------------------
+# Pre-seeds the WebUI password. Without this, `:8200` is reachable without
+# authentication between container start and first admin visit — and
+# `/:/source:ro` lets any LAN browser read the whole filesystem, including
+# the .env files that hold the DB encryption keys.
+#
+# Also pre-creates /var/backups/duplicati as a local-destination dir and
+# writes an import-ready JSON so the user can one-click set up a backup of
+# the load-bearing state (~/vibe-tb/, ~/vibe-mb/, docker volumes, nginx conf).
 phase_8_duplicati() {
     phase "PHASE 8 — Deploy Duplicati Backup"
-    if container_running duplicati; then
-        ok "Duplicati already running"
-        return
+
+    mkdir -p "$HOME/vibe-duplicati"
+    local pw_file="$HOME/vibe-duplicati/webui-password"
+    touch "$pw_file"
+    chmod 600 "$pw_file"
+    local webui_pw
+    if [ -s "$pw_file" ]; then
+        webui_pw="$(cat "$pw_file")"
+    else
+        webui_pw="$(openssl rand -base64 32 | tr -d '=+/' | head -c 24)"
+        printf '%s\n' "$webui_pw" > "$pw_file"
+        chmod 600 "$pw_file"
     fi
-    container_exists duplicati && sudo docker rm -f duplicati >/dev/null
-    sudo docker run -d \
-        --name duplicati \
-        --restart=always \
-        --network kisaes-net \
-        -p 8200:8200 \
-        -v duplicati_config:/data \
-        -v /:/source:ro \
-        lscr.io/linuxserver/duplicati:latest >/dev/null
-    ok "Duplicati started — configure backups at http://<host>:8200"
+
+    # Local backup destination. Outside $HOME so it survives user-home wipes
+    # and so Duplicati (running as the container's abc user) can always write.
+    sudo mkdir -p /var/backups/duplicati
+    sudo chmod 0777 /var/backups/duplicati
+
+    if container_running duplicati; then
+        ok "Duplicati already running (credentials in $pw_file)"
+    else
+        container_exists duplicati && sudo docker rm -f duplicati >/dev/null
+        sudo docker run -d \
+            --name duplicati \
+            --restart=always \
+            --network kisaes-net \
+            -p 8200:8200 \
+            -e "CLI_ARGS=--webservice-password=${webui_pw} --webservice-allowed-hostnames=*" \
+            -v duplicati_config:/data \
+            -v /:/source:ro \
+            -v /var/backups/duplicati:/backups \
+            lscr.io/linuxserver/duplicati:latest >/dev/null
+        ok "Duplicati started with pre-seeded password (file: $pw_file)"
+    fi
+
+    # Emit an import-ready backup config pointing at the local destination.
+    # User imports via Duplicati UI: Add backup → Import from a file.
+    local import_file="$HOME/vibe-duplicati/vibe-default-backup.json"
+    cat > "$import_file" <<EOF
+{
+  "CreatedByVersion": "2.0.0.0",
+  "Backup": {
+    "Name": "Vibe appliance — full state",
+    "Description": "Load-bearing state: app env files, docker volumes, nginx conf. Without \\\$HOME/vibe-*/.env the encrypted DBs are unrecoverable.",
+    "TargetURL": "file:///backups/vibe-appliance",
+    "Tags": []
+  },
+  "Sources": [
+    { "Path": "/source${HOME}/vibe-tb/",      "FilterGroups": ["DefaultExcludes"] },
+    { "Path": "/source${HOME}/vibe-mb/",      "FilterGroups": ["DefaultExcludes"] },
+    { "Path": "/source/var/lib/docker/volumes/", "FilterGroups": ["DefaultExcludes"] },
+    { "Path": "/source/etc/nginx/",           "FilterGroups": ["DefaultExcludes"] },
+    { "Path": "/source/var/www/kisaes/",      "FilterGroups": ["DefaultExcludes"] }
+  ],
+  "Schedule": {
+    "Repeat": "1D",
+    "AllowedDays": ["mon","tue","wed","thu","fri","sat","sun"]
+  }
+}
+EOF
+    chmod 600 "$import_file"
+    ok "Default backup config: $import_file (import via :8200 UI)"
 }
 
 # ---- Phase 9: Tailscale --------------------------------------------------
@@ -457,9 +549,17 @@ phase_9_tailscale() {
         sudo tailscale up --ssh --accept-dns --auth-key="$TAILSCALE_AUTHKEY"
     else
         warn "Tailscale needs interactive auth."
-        warn "The next command will print a URL. Open it in a browser to register this node."
-        warn "The script will resume automatically once auth completes."
-        sudo tailscale up --ssh --accept-dns
+        warn "A URL will appear below — open it in a browser to register this node."
+        warn "Auth window: 10 minutes. After that the phase gives up so provisioning"
+        warn "finishes; resume later with: sudo tailscale up --ssh --accept-dns"
+        # timeout (not tailscale's builtin timeout flag) so we can keep ERR trap
+        # meaningful. Exit 124 = timeout expired; treat that as non-fatal here so
+        # the rest of the box (nginx, firewall, mDNS) still comes up.
+        if ! sudo timeout 600 tailscale up --ssh --accept-dns; then
+            warn "Tailscale auth did not complete in 10 minutes — continuing without it."
+            warn "To finish later: sudo tailscale up --ssh --accept-dns"
+            return 0
+        fi
     fi
     ok "Tailscale up: $(tailscale ip -4 | head -1)"
 }
@@ -574,7 +674,95 @@ EOF
     ok "Nginx reverse proxy live on ${VIBE_DOMAIN}, tb.${VIBE_DOMAIN}, mb.${VIBE_DOMAIN}"
 }
 
+# ---- Phase 12b: mDNS aliases --------------------------------------------
+# Publish <VIBE_DOMAIN>, tb.<VIBE_DOMAIN>, mb.<VIBE_DOMAIN> as mDNS A records
+# so any client on the LAN (macOS, Linux, Windows 10 1803+, iOS, Android 12+)
+# resolves them without /etc/hosts edits or router DNS. Only meaningful when
+# VIBE_DOMAIN ends in .local — otherwise this phase is skipped.
+phase_12b_mdns() {
+    phase "PHASE 12b — Publish mDNS aliases"
+    if [[ "$VIBE_DOMAIN" != *.local ]]; then
+        warn "VIBE_DOMAIN=${VIBE_DOMAIN} is not a .local domain — skipping mDNS publish."
+        warn "Configure DNS for ${VIBE_DOMAIN} via your router or /etc/hosts instead."
+        return 0
+    fi
+    if ! command -v avahi-publish &>/dev/null; then
+        err "avahi-publish not found. Phase 1 should have installed avahi-utils."
+        return 1
+    fi
+
+    # Publisher script: detects LAN IP at start-up and publishes three aliases.
+    # Runs in foreground (systemd Type=simple) so Restart=always works.
+    sudo tee /usr/local/bin/vibe-mdns-publish > /dev/null <<'EOF'
+#!/usr/bin/env bash
+# Publish <DOMAIN>, tb.<DOMAIN>, mb.<DOMAIN> via mDNS. Managed by systemd.
+set -eu
+DOMAIN="${1:?usage: vibe-mdns-publish <domain>}"
+
+# Prefer an explicit MDNS_IP, else auto-detect the LAN IP (RFC1918, not CGNAT).
+# Filters out Tailscale (100.64.0.0/10) and link-local (169.254.0.0/16).
+if [ -n "${MDNS_IP:-}" ]; then
+    IP="$MDNS_IP"
+else
+    IP="$(ip -4 -o addr show scope global \
+            | awk '{print $4}' | cut -d/ -f1 \
+            | grep -E '^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)' \
+            | head -1 || true)"
+fi
+if [ -z "${IP:-}" ]; then
+    echo "vibe-mdns: could not detect a LAN IPv4 (set MDNS_IP=... to override)" >&2
+    exit 1
+fi
+
+echo "vibe-mdns: publishing ${DOMAIN}, tb.${DOMAIN}, mb.${DOMAIN} -> ${IP}"
+# Kill all children on exit so systemd restart cleanly reclaims the records.
+trap 'kill 0' EXIT INT TERM
+avahi-publish -a -R "${DOMAIN}"    "$IP" &
+avahi-publish -a -R "tb.${DOMAIN}" "$IP" &
+avahi-publish -a -R "mb.${DOMAIN}" "$IP" &
+wait
+EOF
+    sudo chmod +x /usr/local/bin/vibe-mdns-publish
+
+    sudo tee /etc/systemd/system/vibe-mdns.service > /dev/null <<EOF
+[Unit]
+Description=Publish Vibe mDNS aliases (${VIBE_DOMAIN}, tb.${VIBE_DOMAIN}, mb.${VIBE_DOMAIN})
+After=network-online.target avahi-daemon.service
+Wants=network-online.target
+Requires=avahi-daemon.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/vibe-mdns-publish ${VIBE_DOMAIN}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    sudo systemctl daemon-reload
+    sudo systemctl enable vibe-mdns.service >/dev/null 2>&1
+    sudo systemctl restart vibe-mdns.service
+
+    # Give Avahi a couple of seconds to register, then verify with avahi-resolve.
+    sleep 2
+    if avahi-resolve -n4 "${VIBE_DOMAIN}" >/dev/null 2>&1; then
+        ok "mDNS aliases live: ${VIBE_DOMAIN}, tb.${VIBE_DOMAIN}, mb.${VIBE_DOMAIN}"
+    else
+        warn "vibe-mdns.service started but ${VIBE_DOMAIN} did not resolve yet."
+        warn "Check: systemctl status vibe-mdns.service  (may take ~10s on first boot)"
+    fi
+}
+
 # ---- Phase 13: UFW -------------------------------------------------------
+# WARNING: Docker publishes ports via iptables rules that are applied BEFORE
+# UFW's DOCKER-USER hook on a stock Ubuntu install. UFW does NOT firewall
+# docker-published ports (9443, 8200, 3000, 3001, 8090, etc.). What UFW
+# actually protects here is host-level services: SSH (22), host nginx (80),
+# Cockpit (9090), and mDNS (5353/udp). Docker-published ports are reachable
+# on every interface the host has a route to — fine for a LAN appliance
+# behind NAT, NOT fine if this box is ever given a public IP.
 phase_13_ufw() {
     phase "PHASE 13 — Configure UFW firewall"
     sudo ufw --force default deny incoming >/dev/null
@@ -582,8 +770,15 @@ phase_13_ufw() {
     sudo ufw allow from 192.168.0.0/16 to any port 22   >/dev/null || true
     sudo ufw allow from 192.168.0.0/16 to any port 80   >/dev/null || true
     sudo ufw allow from 192.168.0.0/16 to any port 9090 >/dev/null || true
+    # mDNS — required for .local hostname resolution from LAN clients.
+    sudo ufw allow from 192.168.0.0/16 to any port 5353 proto udp >/dev/null || true
     sudo ufw --force enable >/dev/null
-    ok "UFW active (LAN-only on 22/80/9090)"
+    ok "UFW active on host-level ports (22/80/9090; mDNS 5353/udp)"
+    warn "UFW does NOT protect docker-published ports (9443, 8200, 3000, 3001, 8090)."
+    warn "Docker's iptables rules run before UFW's DOCKER-USER chain. These ports"
+    warn "are LAN-reachable regardless of UFW. Safe for a LAN appliance behind NAT;"
+    warn "do NOT expose this host to the public internet without fronting it with"
+    warn "a separate firewall or installing ufw-docker."
 }
 
 # ---- Phase 14: Final verification ----------------------------------------
@@ -609,18 +804,47 @@ phase_14_verify() {
         err "Landing vhost returned HTTP $code"; fail=1
     fi
 
-    code="$(curl -s -o /dev/null -w '%{http_code}' -H "Host: tb.${VIBE_DOMAIN}" http://localhost/)"
-    if [ "$code" = "200" ] || [ "$code" = "302" ]; then
-        ok "TB vhost (tb.${VIBE_DOMAIN}) → HTTP $code"
+    # Deep health: go through host nginx → container nginx → Node server,
+    # so a 200 here proves the whole chain is live (not just that nginx can
+    # serve an error page). /api/v1/health on TB is implemented in the server
+    # route table; /api/health on MB does a real SELECT 1 against Postgres.
+    local tb_body mb_body
+    tb_body="$(curl -fsS --max-time 10 -H "Host: tb.${VIBE_DOMAIN}" http://localhost/api/v1/health 2>/dev/null || true)"
+    if echo "$tb_body" | grep -qiE '"status"\s*:\s*"ok"|"ok"\s*:\s*true'; then
+        ok "TB /api/v1/health → server reachable"
     else
-        warn "TB vhost returned HTTP $code (may still be warming up)"
+        warn "TB /api/v1/health did not return ok (body: ${tb_body:-<empty>})"
+        warn "  Check: sudo docker logs --tail 50 vibe-tb-server"
     fi
 
-    code="$(curl -s -o /dev/null -w '%{http_code}' -H "Host: mb.${VIBE_DOMAIN}" http://localhost/)"
-    if [ "$code" = "200" ] || [ "$code" = "302" ] || [ "$code" = "404" ]; then
-        ok "MB vhost (mb.${VIBE_DOMAIN}) → HTTP $code"
+    mb_body="$(curl -fsS --max-time 10 -H "Host: mb.${VIBE_DOMAIN}" http://localhost/api/health 2>/dev/null || true)"
+    if echo "$mb_body" | grep -q '"status":"ok"'; then
+        ok "MB /api/health → server + DB OK"
+    elif echo "$mb_body" | grep -q '"status":"degraded"'; then
+        warn "MB /api/health → degraded (DB probe failed). Body: $mb_body"
+        warn "  Check: sudo docker logs --tail 50 vibe-mb-app   sudo docker logs --tail 50 vibe-mb-db"
     else
-        warn "MB vhost returned HTTP $code (may still be warming up)"
+        warn "MB /api/health did not return ok/degraded (body: ${mb_body:-<empty>})"
+        warn "  Check: sudo docker logs --tail 50 vibe-mb-app"
+    fi
+
+    # Cheap surface-level landing check — separate because a dead backend
+    # shouldn't mask a working landing page.
+    code="$(curl -s -o /dev/null -w '%{http_code}' -H "Host: tb.${VIBE_DOMAIN}" http://localhost/)"
+    [ "$code" = "200" ] && ok "TB SPA bundle served (HTTP 200)" || warn "TB SPA HTTP $code"
+    code="$(curl -s -o /dev/null -w '%{http_code}' -H "Host: mb.${VIBE_DOMAIN}" http://localhost/)"
+    [ "$code" = "200" ] && ok "MB SPA bundle served (HTTP 200)" || warn "MB SPA HTTP $code"
+
+    if [[ "$VIBE_DOMAIN" == *.local ]]; then
+        if systemctl is-active --quiet vibe-mdns.service; then
+            if avahi-resolve -n4 "${VIBE_DOMAIN}" >/dev/null 2>&1; then
+                ok "mDNS: ${VIBE_DOMAIN} resolves locally"
+            else
+                warn "mDNS: vibe-mdns.service active but ${VIBE_DOMAIN} not resolving yet"
+            fi
+        else
+            err "mDNS: vibe-mdns.service is not active"; fail=1
+        fi
     fi
 
     if [ "$SKIP_TAILSCALE" -eq 0 ] && command -v tailscale &>/dev/null; then
@@ -668,6 +892,7 @@ main() {
     phase_10_cockpit
     phase_11_landing
     phase_12_nginx
+    phase_12b_mdns
     phase_13_ufw
     phase_14_verify
 
@@ -681,37 +906,90 @@ main() {
         ts_ip="$(tailscale ip -4 2>/dev/null | head -1 || true)"
     fi
 
-    echo "${BOLD}DNS setup required${RESET} — the three apps resolve by hostname, not IP."
-    echo "Point these three names at this box (pick ONE approach):"
-    echo ""
-    echo "  ${VIBE_DOMAIN}"
-    echo "  tb.${VIBE_DOMAIN}"
-    echo "  mb.${VIBE_DOMAIN}"
-    echo ""
-    echo "${BOLD}Option A — /etc/hosts on each client machine${RESET}"
-    if [ -n "$lan_ip" ]; then
-        echo "    $lan_ip  ${VIBE_DOMAIN} tb.${VIBE_DOMAIN} mb.${VIBE_DOMAIN}"
+    if [[ "$VIBE_DOMAIN" == *.local ]]; then
+        echo "${BOLD}DNS:${RESET} these three names are published via mDNS and should resolve"
+        echo "automatically on any LAN client without /etc/hosts edits:"
+        echo ""
+        echo "  http://${VIBE_DOMAIN}/"
+        echo "  http://tb.${VIBE_DOMAIN}/"
+        echo "  http://mb.${VIBE_DOMAIN}/"
+        echo ""
+        echo "Expected to work out-of-the-box on:"
+        echo "  • macOS / iOS / Android 12+          (native mDNS)"
+        echo "  • Ubuntu / most Linux desktops       (nss-mdns via avahi)"
+        echo "  • Windows 10 1803+ / Windows 11      (native mDNS — set network"
+        echo "      profile to Private, not Public, or Defender Firewall blocks it)"
+        echo ""
+        echo "${BOLD}Fallback if mDNS is blocked${RESET} (rare — corporate firewalls, VLANs):"
+        if [ -n "$lan_ip" ]; then
+            echo "  /etc/hosts entry on the client:"
+            echo "    $lan_ip  ${VIBE_DOMAIN} tb.${VIBE_DOMAIN} mb.${VIBE_DOMAIN}"
+        fi
+        if [ -n "$ts_ip" ]; then
+            echo ""
+            echo "  Over Tailscale (mDNS doesn't traverse the Tailscale network) use:"
+            echo "    $ts_ip  ${VIBE_DOMAIN} tb.${VIBE_DOMAIN} mb.${VIBE_DOMAIN}"
+            echo "  or Tailscale split-DNS: Machines → DNS → Split DNS → '${VIBE_DOMAIN}' → $ts_ip"
+        fi
+        echo ""
+        echo "${BOLD}Test from a client:${RESET}  ping ${VIBE_DOMAIN}   (nslookup won't work — uses unicast DNS)"
+        echo ""
+    else
+        echo "${BOLD}DNS setup required${RESET} — the three apps resolve by hostname, not IP."
+        echo "Point these three names at this box (pick ONE approach):"
+        echo ""
+        echo "  ${VIBE_DOMAIN}"
+        echo "  tb.${VIBE_DOMAIN}"
+        echo "  mb.${VIBE_DOMAIN}"
+        echo ""
+        echo "${BOLD}Option A — /etc/hosts on each client machine${RESET}"
+        if [ -n "$lan_ip" ]; then
+            echo "    $lan_ip  ${VIBE_DOMAIN} tb.${VIBE_DOMAIN} mb.${VIBE_DOMAIN}"
+        fi
+        if [ -n "$ts_ip" ]; then
+            echo "    $ts_ip  ${VIBE_DOMAIN} tb.${VIBE_DOMAIN} mb.${VIBE_DOMAIN}    # via Tailscale"
+        fi
+        echo ""
+        echo "${BOLD}Option B — Tailscale split DNS${RESET} (admin console)"
+        echo "    Machines → DNS → Split DNS → add '${VIBE_DOMAIN}' pointing to ${ts_ip:-<this-tailscale-ip>}"
+        echo ""
+        echo "${BOLD}Option C — router / Pi-hole${RESET}"
+        echo "    Add three A records for the names above → ${lan_ip:-<this-lan-ip>}"
+        echo ""
     fi
-    if [ -n "$ts_ip" ]; then
-        echo "    $ts_ip  ${VIBE_DOMAIN} tb.${VIBE_DOMAIN} mb.${VIBE_DOMAIN}    # via Tailscale"
-    fi
-    echo ""
-    echo "${BOLD}Option B — Tailscale split DNS${RESET} (admin console)"
-    echo "    Machines → DNS → Split DNS → add '${VIBE_DOMAIN}' pointing to ${ts_ip:-<this-tailscale-ip>}"
-    echo ""
-    echo "${BOLD}Option C — router / Pi-hole${RESET}"
-    echo "    Add three A records for the names above → ${lan_ip:-<this-lan-ip>}"
-    echo ""
     echo "${BOLD}Then visit:${RESET}"
     echo "  • ${LANDING_URL}/         — landing page"
     echo "  • ${TB_URL}/              — Vibe Trial Balance"
     echo "  • ${MB_URL}/              — Vibe MyBooks"
-    echo "  • https://${lan_ip:-<host>}:9443  — Portainer (create admin within 5 min)"
-    echo "  • http://${lan_ip:-<host>}:8200   — Duplicati (configure backups)"
+    echo "  • https://${lan_ip:-<host>}:9443  — Portainer (admin / see credentials below)"
+    echo "  • https://${lan_ip:-<host>}:9090  — Cockpit (log in with your OS user)"
+    echo "  • http://${lan_ip:-<host>}:8200   — Duplicati (password below; import job from ~/vibe-duplicati/)"
     echo ""
-    echo "${BOLD}Secrets:${RESET} auto-generated and stored in:"
+    echo "${BOLD}Credentials${RESET} (chmod 600 — back these up alongside your .env files):"
+    echo "  • Portainer admin: user=admin  password in ~/vibe-portainer/admin-password"
+    echo "  • Duplicati WebUI: password in ~/vibe-duplicati/webui-password"
+    echo ""
+    echo "${BOLD}Secrets${RESET} (auto-generated, load-bearing — losing these bricks the DBs):"
     echo "  • ~/vibe-tb/.env  (DB_PASSWORD, JWT_SECRET, ENCRYPTION_KEY, ALLOWED_ORIGIN)"
     echo "  • ~/vibe-mb/.env  (POSTGRES_PASSWORD, JWT_SECRET, BACKUP_ENCRYPTION_KEY, CORS_ORIGIN)"
+    echo ""
+    echo "${BOLD}Duplicati backup${RESET} — after first login at :8200:"
+    echo "  1. Set a strong WebUI password (overrides the pre-seeded one)"
+    echo "  2. Add backup → Import from a file → ~/vibe-duplicati/vibe-default-backup.json"
+    echo "  3. Change the destination from the default file:///backups/vibe-appliance"
+    echo "     to something OFF-BOX (S3, SFTP, another disk) — a local-only backup"
+    echo "     doesn't survive the SSD dying."
+    echo ""
+    echo "${BOLD}CORS note${RESET} — both apps allow exactly ONE browser origin each:"
+    echo "  TB: ALLOWED_ORIGIN=${TB_URL}"
+    echo "  MB: CORS_ORIGIN=${MB_URL}"
+    echo "If you need to reach the apps via a different URL (LAN IP, Tailscale IP,"
+    echo "HTTPS reverse proxy, etc.), edit those values in the .env files and"
+    echo "restart the stack:  cd ~/vibe-tb && sudo docker compose --env-file .env up -d"
+    echo ""
+    echo "${BOLD}GLM-OCR${RESET} is running at http://127.0.0.1:8090/ (container-to-container"
+    echo "via vibe-glm-ocr:8090). Vibe TB and Vibe MB do not yet call it by default —"
+    echo "wire it up per each app's Admin UI once the app-side support lands."
     echo ""
     if command -v claude &>/dev/null; then
         echo "Run 'claude' from this directory for ongoing maintenance help."

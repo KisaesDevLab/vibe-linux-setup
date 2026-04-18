@@ -1,6 +1,8 @@
 # CLAUDE.md — Vibe Linux Setup
 
-> **Primary install path is now `./provision.sh`** — an idempotent bash script that executes every phase below end-to-end with no LLM in the loop. This document remains the authoritative reference for what each phase does and is useful when debugging a failed provision or performing manual maintenance. If a user asks you to "run the provisioning guide," prefer executing `provision.sh` over walking through these phases by hand.
+> **`./provision.sh` is the single source of truth.** It's an idempotent bash script that executes every phase below end-to-end with no LLM in the loop. If a user asks you to "run the provisioning guide," **run `provision.sh`** — do not walk through these phases by hand.
+>
+> This document is reference-only. It may drift from `provision.sh` (the script has received idempotency, security, and UX hardening that isn't reflected below — e.g. 127.0.0.1 binding for TB/MB internal ports, pre-seeded Portainer/Duplicati passwords, a new Phase 12b for mDNS aliases, Tailscale auth timeout, deep health checks). **When in doubt, read `provision.sh`.** The commands below are useful for understanding the intent of each phase and for one-off manual debugging, not for fresh provisioning.
 
 You are provisioning a fresh Ubuntu Server 24.04 LTS mini PC. Execute each phase in order. After each phase, run the verification command(s) and confirm they pass before moving on. If a verification fails, diagnose and fix before continuing.
 
