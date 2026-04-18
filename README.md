@@ -40,7 +40,19 @@ curl -fsSL https://raw.githubusercontent.com/KisaesDevLab/vibe-Linux-Setup/main/
   | TAILSCALE_AUTHKEY=tskey-auth-xxxxx bash
 ```
 
-Other env vars: `TB_DB_PASSWORD`, `MB_DB_PASSWORD`. Flags passed to bootstrap are forwarded to `provision.sh` (e.g. `--skip-tailscale`, `--skip-claude`).
+Other env vars:
+
+- `VIBE_DOMAIN` — base hostname for the three apps (default `kisaes.lan`). The provisioner serves:
+  - `http://<VIBE_DOMAIN>/` → landing page
+  - `http://tb.<VIBE_DOMAIN>/` → Vibe Trial Balance
+  - `http://mb.<VIBE_DOMAIN>/` → Vibe MyBooks
+
+  You must point these three names at this box via `/etc/hosts`, router DNS, Pi-hole, or Tailscale Split DNS. The final provisioner output prints exact instructions with your actual IPs.
+- `TAILSCALE_AUTHKEY` — pre-auth key for unattended Tailscale registration.
+
+Secrets (`DB_PASSWORD`, `JWT_SECRET`, `ENCRYPTION_KEY`, `BACKUP_ENCRYPTION_KEY`) are auto-generated via `openssl rand -hex 32` and persisted to `~/vibe-tb/.env` and `~/vibe-mb/.env` (chmod 600). Re-runs of `provision.sh` keep existing values.
+
+Flags pass through to `provision.sh`: `--skip-tailscale`, `--skip-claude`.
 
 ### Running locally after clone
 

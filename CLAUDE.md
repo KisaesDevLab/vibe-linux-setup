@@ -114,45 +114,77 @@ The container should be `Up` and `/health` should return `{"status":"ok"}`.
 
 ## PHASE 5: Deploy Vibe Trial Balance
 
-Create the directory and compose file:
+Vibe TB ships as **three containers**: `db` (Postgres), `server` (Node API, internal-only on :3001), and `client` (Nginx serving the SPA + proxying /api/* to server). See the authoritative source at `KisaesDevLab/Vibe-Trial-Balance/docker-compose.prod.images.yml`.
+
+Generate secrets and write `~/vibe-tb/.env`:
 
 ```bash
 mkdir -p ~/vibe-tb
+cat > ~/vibe-tb/.env <<EOF
+DB_PASSWORD=$(openssl rand -hex 32)
+JWT_SECRET=$(openssl rand -hex 32)
+ENCRYPTION_KEY=$(openssl rand -hex 32)
+ALLOWED_ORIGIN=http://tb.kisaes.lan
+APP_BASE_URL=http://tb.kisaes.lan
+EOF
+chmod 600 ~/vibe-tb/.env
 ```
 
-Write `~/vibe-tb/docker-compose.yml` with this exact content:
+Write `~/vibe-tb/docker-compose.yml`. The client is remapped from `80:80` to **`3000:80`** so host nginx can own port 80 for hostname routing:
 
 ```yaml
 services:
-  vibe-tb-db:
+  db:
     image: postgres:16-alpine
     container_name: vibe-tb-db
     restart: always
     environment:
-      POSTGRES_USER: vibedb
-      POSTGRES_PASSWORD: CHANGE_ME_TB
-      POSTGRES_DB: vibe_tb
-    volumes:
-      - vibe_tb_pgdata:/var/lib/postgresql/data
-    networks:
-      - kisaes-net
+      POSTGRES_USER: vibetb
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: vibe_tb_db
+    volumes: [pgdata:/var/lib/postgresql/data]
+    networks: [kisaes-net]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vibetb -d vibe_tb_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
-  vibe-tb-app:
-    image: ghcr.io/kisaesdevlab/vibe-trial-balance:latest
-    container_name: vibe-tb-app
+  server:
+    image: ghcr.io/kisaesdevlab/vibe-tb-server:latest
+    container_name: vibe-tb-server
     restart: always
-    depends_on:
-      - vibe-tb-db
+    depends_on: { db: { condition: service_healthy } }
     environment:
-      DATABASE_URL: postgres://vibedb:CHANGE_ME_TB@vibe-tb-db:5432/vibe_tb
       NODE_ENV: production
-    ports:
-      - "3000:3000"
-    networks:
-      - kisaes-net
+      PORT: 3001
+      DB_HOST: vibe-tb-db
+      DB_PORT: 5432
+      DB_NAME: vibe_tb_db
+      DB_USER: vibetb
+      DB_PASSWORD: ${DB_PASSWORD}
+      JWT_SECRET: ${JWT_SECRET}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+      ALLOWED_ORIGIN: ${ALLOWED_ORIGIN}
+      APP_BASE_URL: ${APP_BASE_URL}
+    volumes:
+      - uploads:/app/server/uploads
+      - backups:/app/server/backups
+    expose: ["3001"]
+    networks: [kisaes-net]
+
+  client:
+    image: ghcr.io/kisaesdevlab/vibe-tb-client:latest
+    container_name: vibe-tb-client
+    restart: always
+    depends_on: [server]
+    ports: ["3000:80"]
+    networks: [kisaes-net]
 
 volumes:
-  vibe_tb_pgdata:
+  pgdata:
+  uploads:
+  backups:
 
 networks:
   kisaes-net:
@@ -162,7 +194,7 @@ networks:
 Then deploy:
 
 ```bash
-cd ~/vibe-tb && sudo docker compose up -d
+cd ~/vibe-tb && sudo docker compose --env-file .env up -d
 ```
 
 **Verify:**
@@ -170,60 +202,84 @@ cd ~/vibe-tb && sudo docker compose up -d
 sudo docker ps --filter name=vibe-tb --format "{{.Names}} {{.Status}}"
 ```
 
-Both `vibe-tb-app` and `vibe-tb-db` should show as running.
+All three (`vibe-tb-db`, `vibe-tb-server`, `vibe-tb-client`) should show as running.
 
 ---
 
 ## PHASE 6: Deploy Vibe MyBooks
 
-Create the directory and compose file:
+Vibe MB is a single app image plus Postgres + Redis. Authoritative source: `KisaesDevLab/Vibe-MyBooks/docker-compose.prod.yml`. The Postgres user/db is **`kisbooks`** (not `vibedb`), the app listens on **3001** (not 3000), and `/data` must be a host bind mount so uploads and backups survive container recreate.
+
+Generate secrets and write `~/vibe-mb/.env`:
 
 ```bash
-mkdir -p ~/vibe-mb
+mkdir -p ~/vibe-mb/data
+cat > ~/vibe-mb/.env <<EOF
+POSTGRES_PASSWORD=$(openssl rand -hex 32)
+JWT_SECRET=$(openssl rand -hex 32)
+BACKUP_ENCRYPTION_KEY=$(openssl rand -hex 32)
+CORS_ORIGIN=http://mb.kisaes.lan
+EOF
+chmod 600 ~/vibe-mb/.env
 ```
 
-Write `~/vibe-mb/docker-compose.yml` with this exact content:
+Write `~/vibe-mb/docker-compose.yml`:
 
 ```yaml
 services:
-  vibe-mb-db:
+  db:
     image: postgres:16-alpine
     container_name: vibe-mb-db
     restart: always
     environment:
-      POSTGRES_USER: vibedb
-      POSTGRES_PASSWORD: CHANGE_ME_MB
-      POSTGRES_DB: vibe_mb
-    volumes:
-      - vibe_mb_pgdata:/var/lib/postgresql/data
-    networks:
-      - kisaes-net
+      POSTGRES_USER: kisbooks
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: kisbooks
+    volumes: [pgdata:/var/lib/postgresql/data]
+    networks: [kisaes-net]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kisbooks"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
-  vibe-mb-redis:
+  redis:
     image: redis:7-alpine
     container_name: vibe-mb-redis
     restart: always
-    networks:
-      - kisaes-net
+    volumes: [redis-data:/data]
+    networks: [kisaes-net]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
-  vibe-mb-app:
+  app:
     image: ghcr.io/kisaesdevlab/vibe-mybooks:latest
     container_name: vibe-mb-app
     restart: always
     depends_on:
-      - vibe-mb-db
-      - vibe-mb-redis
+      db:    { condition: service_healthy }
+      redis: { condition: service_healthy }
     environment:
-      DATABASE_URL: postgres://vibedb:CHANGE_ME_MB@vibe-mb-db:5432/vibe_mb
-      REDIS_URL: redis://vibe-mb-redis:6379
       NODE_ENV: production
-    ports:
-      - "3001:3000"
-    networks:
-      - kisaes-net
+      PORT: 3001
+      DATABASE_URL: postgresql://kisbooks:${POSTGRES_PASSWORD}@vibe-mb-db:5432/kisbooks
+      REDIS_URL: redis://vibe-mb-redis:6379
+      JWT_SECRET: ${JWT_SECRET}
+      BACKUP_ENCRYPTION_KEY: ${BACKUP_ENCRYPTION_KEY}
+      CORS_ORIGIN: ${CORS_ORIGIN}
+      UPLOAD_DIR: /data/uploads
+      BACKUP_DIR: /data/backups
+    volumes:
+      - ./data:/data
+    ports: ["3001:3001"]
+    networks: [kisaes-net]
 
 volumes:
-  vibe_mb_pgdata:
+  pgdata:
+  redis-data:
 
 networks:
   kisaes-net:
@@ -233,7 +289,7 @@ networks:
 Then deploy:
 
 ```bash
-cd ~/vibe-mb && sudo docker compose up -d
+cd ~/vibe-mb && sudo docker compose --env-file .env up -d
 ```
 
 **Verify:**
@@ -351,7 +407,9 @@ The `head` output should start with `<!DOCTYPE html>`.
 
 ---
 
-## PHASE 12: Configure Nginx Reverse Proxy
+## PHASE 12: Configure Nginx Reverse Proxy (hostname-based)
+
+Routing is by **Host header**, not URL path. Three `server_name` blocks serve the three apps. The provisioner uses `VIBE_DOMAIN` (default `kisaes.lan`) — substitute your actual value below.
 
 Remove the default site and write the Kisaes proxy config:
 
@@ -359,31 +417,37 @@ Remove the default site and write the Kisaes proxy config:
 sudo rm -f /etc/nginx/sites-enabled/default
 ```
 
-Write `/etc/nginx/sites-available/kisaes` with this exact content:
+Write `/etc/nginx/sites-available/kisaes` with this exact content (replace `kisaes.lan` with your `VIBE_DOMAIN` if different):
 
 ```nginx
+# Landing page — http://kisaes.lan
 server {
-    listen 80 default_server;
-    listen [::]:80 default_server;
-    server_name _;
+    listen 80;
+    listen [::]:80;
+    server_name kisaes.lan;
 
-    # Landing page
     root /var/www/kisaes;
     index index.html;
 
-    location = / {
-        try_files /index.html =404;
+    location / {
+        try_files $uri $uri/ =404;
     }
 
-    # Static assets for landing page
     location ~* \.(css|js|png|jpg|svg|ico|woff2?)$ {
         root /var/www/kisaes;
         expires 7d;
     }
+}
 
-    # Vibe Trial Balance
-    location /tb/ {
-        proxy_pass http://127.0.0.1:3000/;
+# Vibe Trial Balance — http://tb.kisaes.lan
+server {
+    listen 80;
+    listen [::]:80;
+    server_name tb.kisaes.lan;
+    client_max_body_size 50m;
+
+    location / {
+        proxy_pass http://127.0.0.1:3000;
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
@@ -394,10 +458,17 @@ server {
         proxy_read_timeout 300s;
         proxy_send_timeout 300s;
     }
+}
 
-    # Vibe MyBooks
-    location /mb/ {
-        proxy_pass http://127.0.0.1:3001/;
+# Vibe MyBooks — http://mb.kisaes.lan
+server {
+    listen 80;
+    listen [::]:80;
+    server_name mb.kisaes.lan;
+    client_max_body_size 50m;
+
+    location / {
+        proxy_pass http://127.0.0.1:3001;
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
@@ -408,6 +479,14 @@ server {
         proxy_read_timeout 300s;
         proxy_send_timeout 300s;
     }
+}
+
+# Catch-all: unknown Host → redirect to landing
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+    return 302 http://kisaes.lan$request_uri;
 }
 ```
 
@@ -486,37 +565,41 @@ for svc in docker containerd tailscaled cockpit.socket nginx; do
 done
 ```
 
-### Expected container list (8 containers, all running):
+### Expected container list (9 containers, all running):
 
-| Container        | Port(s)        |
-|------------------|----------------|
-| vibe-glm-ocr     | 8090           |
-| vibe-tb-app      | 3000           |
-| vibe-tb-db       | 5432 (internal)|
-| vibe-mb-app      | 3001→3000      |
-| vibe-mb-db       | 5432 (internal)|
-| vibe-mb-redis    | 6379 (internal)|
-| portainer        | 9443, 8000     |
-| duplicati        | 8200           |
+| Container        | Port(s)           |
+|------------------|-------------------|
+| vibe-glm-ocr     | 8090              |
+| vibe-tb-db       | 5432 (internal)   |
+| vibe-tb-server   | 3001 (internal)   |
+| vibe-tb-client   | 3000 → 80         |
+| vibe-mb-db       | 5432 (internal)   |
+| vibe-mb-redis    | 6379 (internal)   |
+| vibe-mb-app      | 3001              |
+| portainer        | 9443, 8000        |
+| duplicati        | 8200              |
 
-### Access points after completion:
+### Access points after completion (with DNS pointed at this box):
 
-| URL                              | Service                    |
-|----------------------------------|----------------------------|
-| `http://<ip>`                    | Landing page (TB or MB)    |
-| `http://<ip>/tb/`                | Vibe Trial Balance         |
-| `http://<ip>/mb/`                | Vibe MyBooks               |
-| `https://<ip>:9090`              | Cockpit (server mgmt)      |
-| `https://<ip>:9443`              | Portainer (Docker mgmt)    |
-| `http://<ip>:8200`               | Duplicati (backups)        |
-| All of the above via Tailscale IP | Works with no extra config |
+| URL                                   | Service                         |
+|---------------------------------------|---------------------------------|
+| `http://kisaes.lan`                   | Landing page                    |
+| `http://tb.kisaes.lan`                | Vibe Trial Balance              |
+| `http://mb.kisaes.lan`                | Vibe MyBooks                    |
+| `https://<ip>:9090`                   | Cockpit (server mgmt)           |
+| `https://<ip>:9443`                   | Portainer (Docker mgmt)         |
+| `http://<ip>:8200`                    | Duplicati (backups)             |
+| Any of the above via Tailscale IP     | Works after DNS is configured   |
+
+Substitute `kisaes.lan` with whatever `VIBE_DOMAIN` was set to. Clients must resolve the three hostnames to this box (via `/etc/hosts`, router DNS, Pi-hole, or Tailscale Split DNS).
 
 ---
 
 ## POST-PROVISIONING REMINDERS (tell the user)
 
-1. **Change default passwords** — The compose files use `CHANGE_ME_TB` and `CHANGE_ME_MB` as Postgres passwords. These must be replaced with real secrets before production use.
+1. **Configure DNS for the three hostnames** — `${VIBE_DOMAIN}`, `tb.${VIBE_DOMAIN}`, `mb.${VIBE_DOMAIN}` must resolve to this box. Pick one: (a) `/etc/hosts` on each client machine, (b) Tailscale Split DNS, (c) router DNS / Pi-hole.
 2. **Portainer admin** — First visit to `:9443` requires creating an admin account. Do this within 5 minutes of startup or Portainer locks itself.
-3. **Duplicati backup schedule** — Visit `:8200` and configure backup jobs for `/var/lib/docker/volumes/`, `~/vibe-tb/`, `~/vibe-mb/`, `/etc/nginx/`, and `/var/www/kisaes/`.
-4. **Sub-path routing** — If Vibe TB or Vibe MB use React Router, each app needs `basename="/tb"` or `basename="/mb"` set in its router config so client-side routing works under the Nginx sub-paths.
-5. **Docker image references** — The compose files reference `ghcr.io/kisaesdevlab/vibe-trial-balance:latest` and `ghcr.io/kisaesdevlab/vibe-mybooks:latest`. Update these to match the actual published image names if different.
+3. **Duplicati backup schedule** — Visit `:8200` and configure backup jobs for `/var/lib/docker/volumes/`, `~/vibe-tb/` (includes `.env`), `~/vibe-mb/` (includes `.env` and `./data/`), `/etc/nginx/`, and `/var/www/kisaes/`.
+4. **Secrets** — `provision.sh` auto-generates `DB_PASSWORD` / `JWT_SECRET` / `ENCRYPTION_KEY` / `BACKUP_ENCRYPTION_KEY` into `~/vibe-tb/.env` and `~/vibe-mb/.env` (chmod 600). These files are load-bearing — back them up separately from the database dumps (without them, the DBs are unrecoverable).
+5. **Anthropic API key (optional)** — To use Claude-backed AI features in Vibe TB, add `ANTHROPIC_API_KEY=sk-ant-...` to `~/vibe-tb/.env` and restart: `cd ~/vibe-tb && sudo docker compose --env-file .env up -d`. Also configurable later inside the app under Admin → Settings → AI Provider.
+6. **Origins** — `ALLOWED_ORIGIN` (TB) and `CORS_ORIGIN` (MB) are set to the hostname URLs. If you also want to access via LAN IP or Tailscale IP, edit those values in the `.env` files and restart the respective compose stack.
