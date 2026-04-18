@@ -220,10 +220,14 @@ cat > ~/vibe-mb/.env <<EOF
 POSTGRES_PASSWORD=$(openssl rand -hex 32)
 JWT_SECRET=$(openssl rand -hex 32)
 BACKUP_ENCRYPTION_KEY=$(openssl rand -hex 32)
+ENCRYPTION_KEY=$(openssl rand -hex 32)
+PLAID_ENCRYPTION_KEY=$(openssl rand -hex 32)
 CORS_ORIGIN=http://mb.kisaes.lan
 EOF
 chmod 600 ~/vibe-mb/.env
 ```
+
+> `ENCRYPTION_KEY` and `PLAID_ENCRYPTION_KEY` are **required** by the `vibe-mybooks` image's in-container bootstrap. Without them, the container crash-loops with "missing required environment variables" on first boot. They match the upstream MB `.env.example`.
 
 Write `~/vibe-mb/docker-compose.yml`:
 
@@ -271,6 +275,8 @@ services:
       REDIS_URL: redis://vibe-mb-redis:6379
       JWT_SECRET: ${JWT_SECRET}
       BACKUP_ENCRYPTION_KEY: ${BACKUP_ENCRYPTION_KEY}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+      PLAID_ENCRYPTION_KEY: ${PLAID_ENCRYPTION_KEY}
       CORS_ORIGIN: ${CORS_ORIGIN}
       UPLOAD_DIR: /data/uploads
       BACKUP_DIR: /data/backups
@@ -512,6 +518,77 @@ curl -s -o /dev/null -w "%{http_code}" http://localhost/
 
 ---
 
+## PHASE 12c: IP:port fallback listeners
+
+Windows browsers with Secure DNS / DoH (Chrome, Edge, Firefox) bypass the Windows mDNS resolver entirely — `*.kisaes.local` fails in the browser even when `ping kisaes.local` succeeds from the same box. Router DNS is the "real" fix, but this phase publishes IP:port listeners that work with zero client-side config:
+
+- `http://<lan-ip>:3080/` → Vibe Trial Balance (Host rewritten to `tb.${VIBE_DOMAIN}`)
+- `http://<lan-ip>:3081/` → Vibe MyBooks (Host rewritten to `mb.${VIBE_DOMAIN}`)
+
+The Host header rewrite means backends see the canonical vhost regardless of which URL the user typed, so CORS / cookies / absolute links behave identically.
+
+Write `/etc/nginx/sites-available/kisaes-ip-ports`:
+
+```nginx
+server {
+    listen 3080;
+    listen [::]:3080;
+    server_name _;
+    client_max_body_size 50m;
+
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host tb.kisaes.local;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+    }
+}
+
+server {
+    listen 3081;
+    listen [::]:3081;
+    server_name _;
+    client_max_body_size 50m;
+
+    location / {
+        proxy_pass http://127.0.0.1:3001;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host mb.kisaes.local;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+    }
+}
+```
+
+Enable and reload:
+
+```bash
+sudo ln -sf /etc/nginx/sites-available/kisaes-ip-ports /etc/nginx/sites-enabled/kisaes-ip-ports
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+**Verify:**
+```bash
+curl -sI http://127.0.0.1:3080/
+curl -sI http://127.0.0.1:3081/
+```
+
+Both should return `HTTP/1.1 200 OK`.
+
+---
+
 ## PHASE 13: Configure UFW Firewall
 
 ```bash
@@ -520,6 +597,9 @@ sudo ufw default allow outgoing
 sudo ufw allow from 192.168.0.0/16 to any port 22
 sudo ufw allow from 192.168.0.0/16 to any port 80
 sudo ufw allow from 192.168.0.0/16 to any port 9090
+sudo ufw allow from 192.168.0.0/16 to any port 3080
+sudo ufw allow from 192.168.0.0/16 to any port 3081
+sudo ufw allow from 192.168.0.0/16 to any port 5353 proto udp
 sudo ufw --force enable
 ```
 
@@ -528,7 +608,7 @@ sudo ufw --force enable
 sudo ufw status verbose
 ```
 
-Should show `Status: active` with rules for ports 22, 80, and 9090.
+Should show `Status: active` with rules for ports 22, 80, 9090, 3080, 3081, and 5353/udp.
 
 ---
 
