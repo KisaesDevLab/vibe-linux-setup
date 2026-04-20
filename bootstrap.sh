@@ -13,7 +13,7 @@
 #   3. Executes provision.sh, which does everything else:
 #        - Docker + shared network
 #        - GLM-OCR, Vibe TB, Vibe MB, Portainer, Duplicati
-#        - Tailscale, Cockpit, Nginx landing page, UFW firewall
+#        - Tailscale, Webmin, Nginx landing page, UFW firewall
 #        - Claude Code (for ongoing maintenance)
 #
 # Environment passthrough (optional):

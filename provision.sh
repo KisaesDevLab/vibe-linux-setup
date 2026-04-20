@@ -623,13 +623,24 @@ phase_9_tailscale() {
     ok "Tailscale up: $(tailscale ip -4 | head -1)"
 }
 
-# ---- Phase 10: Cockpit ---------------------------------------------------
-phase_10_cockpit() {
-    phase "PHASE 10 — Install Cockpit"
-    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-        cockpit cockpit-networkmanager cockpit-storaged cockpit-packagekit
-    sudo systemctl enable --now cockpit.socket >/dev/null 2>&1
-    ok "Cockpit listening on https://<host>:9090"
+# ---- Phase 10: Webmin ----------------------------------------------------
+# Webmin listens on https://<host>:10000 and authenticates against system
+# users via PAM — log in with the OS user that ran this script (must be in
+# the sudoers group to do anything useful). No separate admin account.
+phase_10_webmin() {
+    phase "PHASE 10 — Install Webmin"
+    if dpkg -s webmin >/dev/null 2>&1; then
+        ok "Webmin already installed ($(dpkg -s webmin | awk '/^Version:/ {print $2}'))"
+    else
+        # Official setup-repos.sh configures the signing key + apt source.
+        # -f = force, non-interactive. Idempotent: safe if repo already exists.
+        curl -fsSL https://raw.githubusercontent.com/webmin/webmin/master/setup-repos.sh \
+            | sudo sh -s -- -f >/dev/null
+        sudo apt-get update -qq
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --install-recommends webmin
+    fi
+    sudo systemctl enable --now webmin >/dev/null 2>&1 || true
+    ok "Webmin listening on https://<host>:10000 (log in with your OS user)"
 }
 
 # ---- Phase 11: Landing page ----------------------------------------------
@@ -887,16 +898,16 @@ EOF
 # UFW's DOCKER-USER hook on a stock Ubuntu install. UFW does NOT firewall
 # docker-published ports (9443, 8200, 3000, 3001, 8090, etc.). What UFW
 # actually protects here is host-level services: SSH (22), host nginx (80),
-# Cockpit (9090), and mDNS (5353/udp). Docker-published ports are reachable
+# Webmin (10000), and mDNS (5353/udp). Docker-published ports are reachable
 # on every interface the host has a route to — fine for a LAN appliance
 # behind NAT, NOT fine if this box is ever given a public IP.
 phase_13_ufw() {
     phase "PHASE 13 — Configure UFW firewall"
     sudo ufw --force default deny incoming >/dev/null
     sudo ufw --force default allow outgoing >/dev/null
-    sudo ufw allow from 192.168.0.0/16 to any port 22   >/dev/null || true
-    sudo ufw allow from 192.168.0.0/16 to any port 80   >/dev/null || true
-    sudo ufw allow from 192.168.0.0/16 to any port 9090 >/dev/null || true
+    sudo ufw allow from 192.168.0.0/16 to any port 22    >/dev/null || true
+    sudo ufw allow from 192.168.0.0/16 to any port 80    >/dev/null || true
+    sudo ufw allow from 192.168.0.0/16 to any port 10000 >/dev/null || true
     # IP:port fallback listeners (Phase 12c) — reached when browser DNS
     # bypasses mDNS (Chrome/Edge Secure DNS, Firefox DoH).
     sudo ufw allow from 192.168.0.0/16 to any port 3080 >/dev/null || true
@@ -904,7 +915,7 @@ phase_13_ufw() {
     # mDNS — required for .local hostname resolution from LAN clients.
     sudo ufw allow from 192.168.0.0/16 to any port 5353 proto udp >/dev/null || true
     sudo ufw --force enable >/dev/null
-    ok "UFW active on host-level ports (22/80/9090/3080/3081; mDNS 5353/udp)"
+    ok "UFW active on host-level ports (22/80/10000/3080/3081; mDNS 5353/udp)"
     warn "UFW does NOT protect docker-published ports (9443, 8200, 3000, 3001, 8090)."
     warn "Docker's iptables rules run before UFW's DOCKER-USER chain. These ports"
     warn "are LAN-reachable regardless of UFW. Safe for a LAN appliance behind NAT;"
@@ -1004,7 +1015,7 @@ phase_14_verify() {
     fi
 
     log "Boot-time enabled services:"
-    for svc in docker containerd tailscaled cockpit.socket nginx; do
+    for svc in docker containerd tailscaled webmin nginx; do
         local state
         state="$(sudo systemctl is-enabled "$svc" 2>/dev/null || echo missing)"
         printf '    %-20s %s\n' "$svc" "$state" | tee -a "$LOG_FILE"
@@ -1035,7 +1046,7 @@ main() {
     phase_7_portainer
     phase_8_duplicati
     phase_9_tailscale
-    phase_10_cockpit
+    phase_10_webmin
     phase_11_landing
     phase_12_nginx
     phase_12b_mdns
@@ -1120,12 +1131,16 @@ main() {
     echo "  • ${TB_URL}/              — Vibe Trial Balance"
     echo "  • ${MB_URL}/              — Vibe MyBooks"
     echo "  • https://${lan_ip:-<host>}:9443  — Portainer (admin / see credentials below)"
-    echo "  • https://${lan_ip:-<host>}:9090  — Cockpit (log in with your OS user)"
+    echo "  • https://${lan_ip:-<host>}:10000 — Webmin (log in with your OS user — must be a sudoer)"
     echo "  • http://${lan_ip:-<host>}:8200   — Duplicati (password below; import job from ~/vibe-duplicati/)"
     echo ""
+    local portainer_pw="" duplicati_pw=""
+    [ -s "$HOME/vibe-portainer/admin-password" ] && portainer_pw="$(cat "$HOME/vibe-portainer/admin-password")"
+    [ -s "$HOME/vibe-duplicati/webui-password" ] && duplicati_pw="$(cat "$HOME/vibe-duplicati/webui-password")"
     echo "${BOLD}Credentials${RESET} (chmod 600 — back these up alongside your .env files):"
-    echo "  • Portainer admin: user=admin  password in ~/vibe-portainer/admin-password"
-    echo "  • Duplicati WebUI: password in ~/vibe-duplicati/webui-password"
+    echo "  • Portainer admin: user=admin  password=${portainer_pw:-<missing: see ~/vibe-portainer/admin-password>}"
+    echo "  • Duplicati WebUI: password=${duplicati_pw:-<missing: see ~/vibe-duplicati/webui-password>}"
+    echo "    (Stored at ~/vibe-portainer/admin-password and ~/vibe-duplicati/webui-password, chmod 600)"
     echo ""
     echo "${BOLD}Secrets${RESET} (auto-generated, load-bearing — losing these bricks the DBs):"
     echo "  • ~/vibe-tb/.env  (DB_PASSWORD, JWT_SECRET, ENCRYPTION_KEY, ALLOWED_ORIGIN)"

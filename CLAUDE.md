@@ -377,17 +377,21 @@ Should return a `100.x.x.x` IP address.
 
 ---
 
-## PHASE 10: Install Cockpit
+## PHASE 10: Install Webmin
+
+Webmin provides a web UI for server management on `https://<ip>:10000`. Authentication is against system users via PAM — log in with the OS user you provisioned with (must be in the sudoers group for anything useful). There is no separate admin account.
 
 ```bash
-sudo apt install -y cockpit cockpit-networkmanager cockpit-storaged cockpit-packagekit
-sudo systemctl enable --now cockpit.socket
+curl -fsSL https://raw.githubusercontent.com/webmin/webmin/master/setup-repos.sh | sudo sh -s -- -f
+sudo apt update
+sudo apt install -y --install-recommends webmin
+sudo systemctl enable --now webmin
 ```
 
 **Verify:**
 ```bash
-sudo systemctl is-enabled cockpit.socket
-sudo systemctl is-active cockpit.socket
+sudo systemctl is-enabled webmin
+sudo systemctl is-active webmin
 ```
 
 Both should return `enabled` and `active`.
@@ -596,7 +600,7 @@ sudo ufw default deny incoming
 sudo ufw default allow outgoing
 sudo ufw allow from 192.168.0.0/16 to any port 22
 sudo ufw allow from 192.168.0.0/16 to any port 80
-sudo ufw allow from 192.168.0.0/16 to any port 9090
+sudo ufw allow from 192.168.0.0/16 to any port 10000
 sudo ufw allow from 192.168.0.0/16 to any port 3080
 sudo ufw allow from 192.168.0.0/16 to any port 3081
 sudo ufw allow from 192.168.0.0/16 to any port 5353 proto udp
@@ -608,7 +612,7 @@ sudo ufw --force enable
 sudo ufw status verbose
 ```
 
-Should show `Status: active` with rules for ports 22, 80, 9090, 3080, 3081, and 5353/udp.
+Should show `Status: active` with rules for ports 22, 80, 10000, 3080, 3081, and 5353/udp.
 
 ---
 
@@ -631,8 +635,8 @@ echo "=== Tailscale ==="
 tailscale ip -4
 sudo systemctl is-enabled tailscaled
 
-echo "=== Cockpit ==="
-sudo systemctl is-active cockpit.socket
+echo "=== Webmin ==="
+sudo systemctl is-active webmin
 
 echo "=== Nginx ==="
 sudo nginx -t 2>&1
@@ -642,7 +646,7 @@ echo "=== UFW ==="
 sudo ufw status | head -5
 
 echo "=== Boot services ==="
-for svc in docker containerd tailscaled cockpit.socket nginx; do
+for svc in docker containerd tailscaled webmin nginx; do
   echo "$svc: $(sudo systemctl is-enabled $svc)"
 done
 ```
@@ -668,7 +672,7 @@ done
 | `http://kisaes.lan`                   | Landing page                    |
 | `http://tb.kisaes.lan`                | Vibe Trial Balance              |
 | `http://mb.kisaes.lan`                | Vibe MyBooks                    |
-| `https://<ip>:9090`                   | Cockpit (server mgmt)           |
+| `https://<ip>:10000`                  | Webmin (server mgmt)            |
 | `https://<ip>:9443`                   | Portainer (Docker mgmt)         |
 | `http://<ip>:8200`                    | Duplicati (backups)             |
 | Any of the above via Tailscale IP     | Works after DNS is configured   |

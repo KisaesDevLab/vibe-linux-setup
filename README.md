@@ -10,7 +10,7 @@ Automated provisioning for Ubuntu Server 24.04 LTS machines running the Kisaes a
 | **Vibe MyBooks** | Bookkeeping, transaction coding, client portal | `http://mb.kisaes.local/` |
 | **Landing page** | Card-selector for the two apps | `http://kisaes.local/` |
 | **GLM-OCR** | Self-hosted OCR appliance (llama.cpp + GLM-OCR GGUF) | `http://127.0.0.1:8090/` (host-only) |
-| **Cockpit** | Web-based server + network management | `https://<ip>:9090` |
+| **Webmin** | Web-based server + network management | `https://<ip>:10000` |
 | **Portainer CE** | Docker container management UI | `https://<ip>:9443` |
 | **Duplicati** | Scheduled backups | `http://<ip>:8200` |
 | **Tailscale** | Mesh VPN for secure remote access | All services via `100.x.x.x` |
@@ -26,7 +26,7 @@ On a fresh Ubuntu Server 24.04 LTS box:
 curl -fsSL https://raw.githubusercontent.com/KisaesDevLab/vibe-Linux-Setup/main/bootstrap.sh | bash
 ```
 
-`bootstrap.sh` installs git, clones this repo, and runs `provision.sh`, which executes the 14 phases end-to-end (base packages + Avahi, Docker, shared network, GLM-OCR, Vibe TB, Vibe MB, Portainer, Duplicati, Tailscale, Cockpit, landing page, nginx, mDNS aliases, UFW, verification). It also installs Claude Code for ongoing maintenance.
+`bootstrap.sh` installs git, clones this repo, and runs `provision.sh`, which executes the 14 phases end-to-end (base packages + Avahi, Docker, shared network, GLM-OCR, Vibe TB, Vibe MB, Portainer, Duplicati, Tailscale, Webmin, landing page, nginx, mDNS aliases, UFW, verification). It also installs Claude Code for ongoing maintenance.
 
 The script is **idempotent** — containers, volumes, secrets, and firewall rules all no-op if they already exist, so re-running after a failure resumes cleanly.
 
@@ -102,7 +102,7 @@ mDNS doesn't traverse Tailscale and may be blocked on corporate networks or VLAN
 │                                                                            │
 └────────────────────────────────────────────────────────────────────────────┘
 
-Port 9090        → Cockpit (server management; UFW-restricted to LAN)
+Port 10000       → Webmin (server management; UFW-restricted to LAN; PAM auth)
 Port 9443        → Portainer (Docker UI; admin password pre-seeded)
 Port 8200        → Duplicati (backups; WebUI password pre-seeded)
 Port 8090        → GLM-OCR (bound to 127.0.0.1; container-to-container via
@@ -161,7 +161,7 @@ The final phase prints this with your actual IPs substituted:
 
 - **GLM-OCR is not yet called by Vibe TB / Vibe MB.** The apps currently expect an Ollama-style OCR endpoint; GLM-OCR serves an OpenAI-compatible API at `/v1/chat/completions`. Wiring requires an app-side change tracked upstream.
 - **CORS is single-origin per app.** Multiple origins (LAN IP + Tailscale + hostname) requires either a PR to the apps' CORS parsing or an HTTPS reverse proxy in front.
-- **Docker-published ports bypass UFW.** Docker's iptables rules run before UFW's `DOCKER-USER` chain on a default Ubuntu install. UFW firewalls host-level services (22/80/9090/5353) only. Ports 9443, 8200, and on-the-LAN access to 80 are reachable regardless of UFW. **Fine for a LAN appliance behind NAT; do not expose this host to the public internet without fronting it with a separate firewall or installing `ufw-docker`.**
+- **Docker-published ports bypass UFW.** Docker's iptables rules run before UFW's `DOCKER-USER` chain on a default Ubuntu install. UFW firewalls host-level services (22/80/10000/5353) only. Ports 9443, 8200, and on-the-LAN access to 80 are reachable regardless of UFW. **Fine for a LAN appliance behind NAT; do not expose this host to the public internet without fronting it with a separate firewall or installing `ufw-docker`.**
 - **Future: consolidate under a single hostname via subpaths** (`/tb/`, `/mb/`) — blocked on upstream app changes; tracked at [KisaesDevLab/Vibe-Trial-Balance#5](https://github.com/KisaesDevLab/Vibe-Trial-Balance/issues/5) and [KisaesDevLab/Vibe-MyBooks#31](https://github.com/KisaesDevLab/Vibe-MyBooks/issues/31).
 
 ## File structure
