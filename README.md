@@ -8,7 +8,8 @@ Automated provisioning for Ubuntu Server 24.04 LTS machines running the Kisaes a
 |---|---|---|
 | **Vibe Trial Balance** | Trial balance, tax workpapers, AI classification | `http://tb.kisaes.local/` |
 | **Vibe MyBooks** | Bookkeeping, transaction coding, client portal | `http://mb.kisaes.local/` |
-| **Landing page** | Card-selector for the two apps | `http://kisaes.local/` |
+| **Vibe Payroll Time** | Time tracking, payroll runs, QR badge punch-ins | `http://pt.kisaes.local/` |
+| **Landing page** | Card-selector for the three apps | `http://kisaes.local/` |
 | **GLM-OCR** | Self-hosted OCR appliance (llama.cpp + GLM-OCR GGUF) | `http://127.0.0.1:8090/` (host-only) |
 | **Webmin** | Web-based server + network management | `https://<ip>:10000` |
 | **Portainer CE** | Docker container management UI | `https://<ip>:9443` |
@@ -26,7 +27,7 @@ On a fresh Ubuntu Server 24.04 LTS box:
 curl -fsSL https://raw.githubusercontent.com/KisaesDevLab/vibe-Linux-Setup/main/bootstrap.sh | bash
 ```
 
-`bootstrap.sh` installs git, clones this repo, and runs `provision.sh`, which executes the 14 phases end-to-end (base packages + Avahi, Docker, shared network, GLM-OCR, Vibe TB, Vibe MB, Portainer, Duplicati, Tailscale, Webmin, landing page, nginx, mDNS aliases, UFW, verification). It also installs Claude Code for ongoing maintenance.
+`bootstrap.sh` installs git, clones this repo, and runs `provision.sh`, which executes every phase end-to-end (base packages + Avahi, Docker, shared network, GLM-OCR, Vibe TB, Vibe MB, Vibe PT, Portainer, Duplicati, Tailscale, Webmin, landing page, nginx, mDNS aliases, IP:port fallback listeners, UFW, verification). It also installs Claude Code for ongoing maintenance.
 
 The script is **idempotent** — containers, volumes, secrets, and firewall rules all no-op if they already exist, so re-running after a failure resumes cleanly.
 
@@ -43,10 +44,11 @@ Tailscale auth has a 10-minute timeout — if no key is provided and nobody clic
 
 ### Environment overrides
 
-- `VIBE_DOMAIN` — base hostname (default `kisaes.local`). The three services are served as:
+- `VIBE_DOMAIN` — base hostname (default `kisaes.local`). The four services are served as:
   - `http://<VIBE_DOMAIN>/` → landing page
   - `http://tb.<VIBE_DOMAIN>/` → Vibe Trial Balance
   - `http://mb.<VIBE_DOMAIN>/` → Vibe MyBooks
+  - `http://pt.<VIBE_DOMAIN>/` → Vibe Payroll Time
 
   A `.local` domain is published automatically via mDNS (avahi) and resolves on every modern client with zero client-side DNS config (see [DNS resolution](#dns-resolution) below). Any other TLD works but you must configure DNS yourself (router, Pi-hole, `/etc/hosts`, or Tailscale Split DNS).
 
@@ -98,21 +100,28 @@ mDNS doesn't traverse Tailscale and may be blocked on corporate networks or VLAN
 │  Host: mb.kisaes.local   → 127.0.0.1:3001 → vibe-mb-app (API + SPA)       │
 │                                           → vibe-mb-db (Postgres)         │
 │                                           → vibe-mb-redis                  │
+│  Host: pt.kisaes.local   → /api/*    → 127.0.0.1:4002 → vibe-pt-backend   │
+│                          → /         → 127.0.0.1:3002 → vibe-pt-frontend  │
+│                                                         → vibe-pt-db       │
 │  Host: <anything else>   → 302 → http://kisaes.local (catch-all)          │
 │                                                                            │
 └────────────────────────────────────────────────────────────────────────────┘
 
-Port 10000       → Webmin (server management; UFW-restricted to LAN; PAM auth)
-Port 9443        → Portainer (Docker UI; admin password pre-seeded)
-Port 8200        → Duplicati (backups; WebUI password pre-seeded)
-Port 8090        → GLM-OCR (bound to 127.0.0.1; container-to-container via
-                   kisaes-net at vibe-glm-ocr:8090)
+Port 3080 / 3081 / 3082  → IP:port fallback listeners for TB / MB / PT
+                           (used by Chrome/Edge Secure DNS and Firefox DoH
+                           clients that bypass the mDNS resolver)
+Port 10000               → Webmin (server mgmt; UFW-restricted to LAN; PAM)
+Port 9443                → Portainer (Docker UI; admin password pre-seeded)
+Port 8200                → Duplicati (backups; WebUI password pre-seeded)
+Port 8090                → GLM-OCR (bound to 127.0.0.1; container-to-
+                           container via kisaes-net at vibe-glm-ocr:8090)
 
-Tailscale        → Mesh VPN overlay reachable from anywhere. mDNS does NOT
-                   traverse Tailscale — use Tailscale IPs or split-DNS.
+Tailscale                → Mesh VPN overlay reachable from anywhere. mDNS
+                           does NOT traverse Tailscale — use Tailscale IPs
+                           or split-DNS.
 ```
 
-The TB client (`:3000`) and MB app (`:3001`) are bound to `127.0.0.1` so only the host nginx can reach them. This forces all LAN traffic through the hostname-based vhosts so CORS, cookies, and rate limits behave consistently.
+The TB client (`:3000`), MB app (`:3001`), and PT backend/frontend (`:4002` / `:3002`) are bound to `127.0.0.1` so only host nginx can reach them. This forces all LAN traffic through the hostname / IP:port listeners so CORS, cookies, and rate limits behave consistently. PT is the only app where host nginx does the `/api/*` vs `/` split itself — TB's client container and MB's app container handle that internally.
 
 ## Container map
 
@@ -120,15 +129,28 @@ The TB client (`:3000`) and MB app (`:3001`) are bound to `127.0.0.1` so only th
 |---|---|---|---|
 | `vibe-glm-ocr` | `ghcr.io/kisaesdevlab/vibe-glm-ocr:latest` | `127.0.0.1:8090` | always |
 | `vibe-tb-db` | `postgres:16-alpine` | internal | always |
-| `vibe-tb-server` | `ghcr.io/kisaesdevlab/vibe-tb-server:latest` | internal (`:3001`) | always |
-| `vibe-tb-client` | `ghcr.io/kisaesdevlab/vibe-tb-client:latest` | `127.0.0.1:3000` | always |
+| `vibe-tb-server` | `ghcr.io/kisaesdevlab/vibe-tb-server:${IMAGE_TAG:-latest}` | internal (`:3001`) | always |
+| `vibe-tb-client` | `ghcr.io/kisaesdevlab/vibe-tb-client:${IMAGE_TAG:-latest}` | `127.0.0.1:3000` | always |
 | `vibe-mb-db` | `postgres:16-alpine` | internal | always |
 | `vibe-mb-redis` | `redis:7-alpine` | internal | always |
-| `vibe-mb-app` | `ghcr.io/kisaesdevlab/vibe-mybooks:latest` | `127.0.0.1:3001` | always |
+| `vibe-mb-app` | `ghcr.io/kisaesdevlab/vibe-mybooks:${VIBE_MYBOOKS_TAG:-latest}` | `127.0.0.1:3001` | always |
+| `vibe-pt-db` | `postgres:16-alpine` | internal | always |
+| `vibe-pt-backend` | `ghcr.io/kisaesdevlab/vibept-backend:latest` | `127.0.0.1:4002` | always |
+| `vibe-pt-frontend` | `ghcr.io/kisaesdevlab/vibept-frontend:latest` | `127.0.0.1:3002` | always |
 | `portainer` | `portainer/portainer-ce:lts` | `0.0.0.0:9443`, `0.0.0.0:8000` | always |
 | `duplicati` | `lscr.io/linuxserver/duplicati:latest` | `0.0.0.0:8200` | always |
 
 All containers share the `kisaes-net` Docker network so they address each other by container name.
+
+**Optional tunnel containers** (dormant unless `CLOUDFLARE_TUNNEL_TOKEN` is set in the matching `.env`):
+
+| Container | Image | Purpose |
+|---|---|---|
+| `vibe-mb-cloudflared` | `cloudflare/cloudflared:latest` | CF tunnel → `vibe-mb-app:3001` |
+| `vibe-pt-caddy` | `caddy:2-alpine` | Internal `/api/*` vs `/` split so the tunnel has one target |
+| `vibe-pt-cloudflared` | `cloudflare/cloudflared:latest` | CF tunnel → `vibe-pt-caddy:8080` |
+
+TB is LAN-only and has no tunnel sidecar.
 
 ## Secrets and credentials
 
@@ -136,8 +158,9 @@ All containers share the `kisaes-net` Docker network so they address each other 
 
 | File | Contents |
 |---|---|
-| `~/vibe-tb/.env` | `DB_PASSWORD`, `JWT_SECRET`, `ENCRYPTION_KEY`, `ALLOWED_ORIGIN`, `APP_BASE_URL` |
-| `~/vibe-mb/.env` | `POSTGRES_PASSWORD`, `JWT_SECRET`, `BACKUP_ENCRYPTION_KEY`, `CORS_ORIGIN` |
+| `~/vibe-tb/.env` | `DB_PASSWORD`, `JWT_SECRET`, `ENCRYPTION_KEY`, `ALLOWED_ORIGIN`, `APP_BASE_URL`, `IMAGE_TAG` |
+| `~/vibe-mb/.env` | `POSTGRES_PASSWORD`, `JWT_SECRET`, `ENCRYPTION_KEY`, `PLAID_ENCRYPTION_KEY`, `BACKUP_ENCRYPTION_KEY`, `CORS_ORIGIN`, `TRUST_PROXY`, `VIBE_MYBOOKS_TAG`, `CLOUDFLARE_TUNNEL_TOKEN` (opt-in), `TUNNEL_ORIGIN` (opt-in) |
+| `~/vibe-pt/.env` | `POSTGRES_PASSWORD`, `JWT_SECRET`, `SECRETS_ENCRYPTION_KEY`, `APPLIANCE_ID`, `CORS_ORIGIN`, `CLOUDFLARE_TUNNEL_TOKEN` (opt-in), `TUNNEL_ORIGIN` (opt-in) |
 | `~/vibe-portainer/admin-password` | Portainer `admin` user password (pre-seeded; no 5-min signup lockout) |
 | `~/vibe-duplicati/webui-password` | Duplicati WebUI password (prevents unauthenticated FS access on `:8200`) |
 | `~/vibe-duplicati/vibe-default-backup.json` | Pre-generated Duplicati backup-job config (import via UI) |
@@ -155,12 +178,18 @@ The final phase prints this with your actual IPs substituted:
    ```bash
    cd ~/vibe-tb && sudo docker compose --env-file .env up -d
    ```
-5. **CORS origins are single-valued.** If you need to reach the apps via a different URL than `tb.kisaes.local` / `mb.kisaes.local` (e.g. Tailscale IP, LAN IP, HTTPS reverse proxy), edit `ALLOWED_ORIGIN` in `~/vibe-tb/.env` or `CORS_ORIGIN` in `~/vibe-mb/.env` and restart the stack.
+5. **Optional: expose MB or PT over Cloudflare Tunnel.** Create a tunnel at [one.dash.cloudflare.com](https://one.dash.cloudflare.com) → Networks → Tunnels, route it to `http://vibe-mb-app:3001` (MB) or `http://vibe-pt-caddy:8080` (PT), then edit the matching `.env`:
+   ```
+   CLOUDFLARE_TUNNEL_TOKEN=<paste from CF>
+   TUNNEL_ORIGIN=https://<your-public-hostname>
+   ```
+   Re-run `./provision.sh`. The provisioner detects the token and brings up the `cloudflared` sidecar (plus a Caddy sidecar for PT), and `CORS_ORIGIN` is rewritten to the public hostname. TB does not have a tunnel sidecar — LAN only.
+6. **CORS origins are single-valued.** If you need to reach the apps via a different URL than the canonical port URL / hostname (e.g. Tailscale IP, LAN IP, different HTTPS proxy), edit `ALLOWED_ORIGIN` in `~/vibe-tb/.env` or `CORS_ORIGIN` in `~/vibe-mb/.env` / `~/vibe-pt/.env` and restart the stack. When `TUNNEL_ORIGIN` is set on MB/PT, the provisioner auto-manages `CORS_ORIGIN` — don't hand-edit it there.
 
 ## Known limitations
 
 - **GLM-OCR is not yet called by Vibe TB / Vibe MB.** The apps currently expect an Ollama-style OCR endpoint; GLM-OCR serves an OpenAI-compatible API at `/v1/chat/completions`. Wiring requires an app-side change tracked upstream.
-- **CORS is single-origin per app.** Multiple origins (LAN IP + Tailscale + hostname) requires either a PR to the apps' CORS parsing or an HTTPS reverse proxy in front.
+- **CORS is single-origin per app.** Multiple origins (LAN IP + Tailscale + hostname + Cloudflare Tunnel all at once) requires either a PR to the apps' CORS parsing or an HTTPS reverse proxy in front. Tracked at [KisaesDevLab/Vibe-Trial-Balance#6](https://github.com/KisaesDevLab/Vibe-Trial-Balance/issues/6), [KisaesDevLab/Vibe-MyBooks#32](https://github.com/KisaesDevLab/Vibe-MyBooks/issues/32), and for PT in the main repo. Until then, enabling a Cloudflare Tunnel flips `CORS_ORIGIN` to the public hostname and LAN port URLs CORS-break.
 - **Docker-published ports bypass UFW.** Docker's iptables rules run before UFW's `DOCKER-USER` chain on a default Ubuntu install. UFW firewalls host-level services (22/80/10000/5353) only. Ports 9443, 8200, and on-the-LAN access to 80 are reachable regardless of UFW. **Fine for a LAN appliance behind NAT; do not expose this host to the public internet without fronting it with a separate firewall or installing `ufw-docker`.**
 - **Future: consolidate under a single hostname via subpaths** (`/tb/`, `/mb/`) — blocked on upstream app changes; tracked at [KisaesDevLab/Vibe-Trial-Balance#5](https://github.com/KisaesDevLab/Vibe-Trial-Balance/issues/5) and [KisaesDevLab/Vibe-MyBooks#31](https://github.com/KisaesDevLab/Vibe-MyBooks/issues/31).
 
